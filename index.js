@@ -79,7 +79,6 @@ app.post('/file',upload.single('file'),async(req,res)=>{
             html: htmlContent,
             github: {
                 repository: uploadResult.repository.url,
-                githubPages: uploadResult.githubPagesUrl,
                 branch: uploadResult.repository.defaultBranch,
                 commit: uploadResult.commit
             },
@@ -227,26 +226,6 @@ async function createRepoAndUploadHTML(htmlContent, repoName, fileName = 'index.
 
         console.log('✓ File uploaded successfully!');
 
-        // Enable GitHub Pages
-        console.log('Enabling GitHub Pages...');
-        try {
-            await octokit.rest.repos.createPagesSite({
-                owner: GITHUB_OWNER,
-                repo: repoName,
-                source: {
-                    branch: repo.default_branch || 'main',
-                    path: '/'
-                }
-            });
-            console.log('✓ GitHub Pages enabled');
-        } catch (error) {
-            if (error.status === 409) {
-                console.log('✓ GitHub Pages already enabled');
-            } else {
-                console.log('⚠ Could not enable GitHub Pages automatically. Enable it manually in repository settings.');
-            }
-        }
-
         // Verify the upload
         console.log('Verifying upload...');
         const { data: verifyFile } = await octokit.rest.repos.getContent({
@@ -268,7 +247,6 @@ async function createRepoAndUploadHTML(htmlContent, repoName, fileName = 'index.
         // Construct URLs
         const htmlUrl = result.content.html_url;
         const rawUrl = `https://raw.githubusercontent.com/${GITHUB_OWNER}/${repoName}/${repo.default_branch}/${fileName}`;
-        const githubPagesUrl = `https://${GITHUB_OWNER}.github.io/${repoName}/${fileName}`;
 
         return {
             success: true,
@@ -285,7 +263,6 @@ async function createRepoAndUploadHTML(htmlContent, repoName, fileName = 'index.
                 downloadUrl: verifyFile.download_url,
                 localPath: tempFilePath
             },
-            githubPagesUrl: githubPagesUrl,
             repository: {
                 name: repo.full_name,
                 url: repo.html_url,
@@ -293,7 +270,7 @@ async function createRepoAndUploadHTML(htmlContent, repoName, fileName = 'index.
                 sshUrl: repo.ssh_url,
                 defaultBranch: repo.default_branch
             },
-            instructions: `GitHub Pages URL may take a few minutes to become active: ${githubPagesUrl}`,
+            instructions: 'Use Vercel deployment URL for live site',
             timestamp: new Date().toISOString()
         };
 
