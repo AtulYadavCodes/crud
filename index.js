@@ -3,11 +3,20 @@ import multer from 'multer';
 import fs from 'fs';
 import axios from 'axios';
 import FormData from 'form-data';
+import { Octokit } from '@octokit/rest';
+import dotenv from 'dotenv';
+
+dotenv.config();
 
 import { main } from './web.js';
 import cors from 'cors';
 //import pdf from 'pdf-parse';
 //const uploadedpath="";
+
+// GitHub Configuration from Environment Variables
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN || 'your_github_personal_access_token_here';
+const GITHUB_OWNER = process.env.GITHUB_OWNER || 'your_github_username';
+
 const app=express();
 app.use(express.json()); app.use(cors(
     {
@@ -25,9 +34,69 @@ const storage = multer.diskStorage({
 const upload = multer({ storage: storage })
 
 app.post('/file',upload.single('file'),async(req,res)=>{
-    const uploadedpath=req.file.path;
-
-    res.status(200).send(await extractpdf(uploadedpath));
+    try {
+        const uploadedpath = req.file.path;
+        
+        // Extract PDF and generate HTML using Gemini
+        console.log('Extracting PDF and generating HTML with Gemini...');
+        const htmlContent = await extractpdf(uploadedpath);
+        
+        if (!htmlContent) {
+            return res.status(500).json({
+                error: 'Failed to generate HTML from resume'
+            });
+        }
+        console.log('✓ HTML generated successfully');
+        
+        // Generate unique repository name
+        const timestamp = Date.now();
+        const repoName = `portfolio-${timestamp}`;
+        const fileName = 'index.html';
+        
+        // Automatically upload to GitHub
+        console.log('Uploading to GitHub...');
+        const uploadResult = await createRepoAndUploadHTML(htmlContent, repoName, fileName);
+        
+        if (!uploadResult.success) {
+            return res.status(500).json({
+                error: 'Failed to upload to GitHub',
+                details: uploadResult
+            });
+        }
+        
+        console.log('✓ Uploaded to GitHub successfully');
+        
+        // Generate Vercel deployment URL
+        const githubRepoUrl = `https://github.com/${GITHUB_OWNER}/${repoName}/tree/${uploadResult.repository.defaultBranch}`;
+        const encodedRepoUrl = encodeURIComponent(githubRepoUrl);
+        const vercelDeployUrl = `https://vercel.com/new/clone?repository-url=${encodedRepoUrl}`;
+        
+        console.log('✓ Vercel deployment URL generated');
+        
+        // Send complete response with HTML, GitHub details, and Vercel URL
+        res.status(200).json({
+            success: true,
+            html: htmlContent,
+            github: {
+                repository: uploadResult.repository.url,
+                githubPages: uploadResult.githubPagesUrl,
+                branch: uploadResult.repository.defaultBranch,
+                commit: uploadResult.commit
+            },
+            vercel: {
+                deployUrl: vercelDeployUrl,
+                instructions: 'Click the URL to deploy on Vercel instantly'
+            },
+            timestamp: uploadResult.timestamp
+        });
+        
+    } catch (error) {
+        console.error('Error in /file endpoint:', error);
+        res.status(500).json({
+            error: 'Server error',
+            message: error.message
+        });
+    }
 });
 // async function extractpdf(filepath){
 //     const databuffer = await fs.readFile(filepath);
@@ -60,6 +129,201 @@ form.append('file',fs.createReadStream(filepath));
     }
 }
 
+// Function to create a new repository and upload HTML file to GitHub
+async function createRepoAndUploadHTML(htmlContent, repoName, fileName = 'index.html') {
+    try {
+        // Validate inputs
+        if (!htmlContent || typeof htmlContent !== 'string') {
+            throw new Error('Invalid HTML content provided');
+        }
+
+        if (!GITHUB_TOKEN || GITHUB_TOKEN === 'your_github_personal_access_token_here') {
+            throw new Error('GitHub token not configured. Please set GITHUB_TOKEN variable.');
+        }
+
+        if (!GITHUB_OWNER || GITHUB_OWNER === 'your_github_username') {
+            throw new Error('GitHub owner not configured. Please set GITHUB_OWNER variable.');
+        }
+
+        if (!repoName) {
+            throw new Error('Repository name is required');
+        }
+
+        console.log('Initializing GitHub upload...');
+        
+        // Initialize Octokit with authentication
+        const octokit = new Octokit({
+            auth: GITHUB_TOKEN
+        });
+
+        // Verify authentication
+        console.log('Verifying GitHub authentication...');
+        const { data: authUser } = await octokit.rest.users.getAuthenticated();
+        console.log(`✓ Authenticated as: ${authUser.login}`);
+
+        // Create new repository
+        console.log(`Creating new repository: ${repoName}...`);
+        let repo;
+        
+        try {
+            const { data: newRepo } = await octokit.rest.repos.createForAuthenticatedUser({
+                name: repoName,
+                description: `Portfolio website generated on ${new Date().toISOString()}`,
+                homepage: `https://${GITHUB_OWNER}.github.io/${repoName}`,
+                private: false,
+                has_issues: false,
+                has_projects: false,
+                has_wiki: false,
+                auto_init: true // Initialize with README to create main branch
+            });
+            repo = newRepo;
+            console.log(`✓ Repository created: ${repo.full_name}`);
+        } catch (error) {
+            if (error.status === 422 && error.message.includes('already exists')) {
+                throw new Error(`Repository "${repoName}" already exists. Please choose a different name.`);
+            }
+            throw error;
+        }
+
+        // Wait a moment for repository initialization
+        console.log('Waiting for repository initialization...');
+        await new Promise(resolve => setTimeout(resolve, 2000));
+
+        // Create HTML file locally
+        const tempFilePath = `./uploads/${fileName}`;
+        
+        // Ensure uploads directory exists
+        if (!fs.existsSync('./uploads')) {
+            fs.mkdirSync('./uploads', { recursive: true });
+        }
+        
+        console.log(`Creating local file: ${fileName}...`);
+        fs.writeFileSync(tempFilePath, htmlContent, 'utf8');
+        console.log('✓ Local file created');
+
+        // Encode content to base64
+        const content = Buffer.from(htmlContent).toString('base64');
+        
+        // Upload file to repository
+        const commitMessage = `Add ${fileName} - ${new Date().toISOString()}`;
+
+        console.log(`Uploading ${fileName} to GitHub...`);
+        
+        const { data: result } = await octokit.rest.repos.createOrUpdateFileContents({
+            owner: GITHUB_OWNER,
+            repo: repoName,
+            path: fileName,
+            message: commitMessage,
+            content: content,
+            committer: {
+                name: authUser.name || authUser.login,
+                email: authUser.email || `${authUser.login}@users.noreply.github.com`
+            },
+            author: {
+                name: authUser.name || authUser.login,
+                email: authUser.email || `${authUser.login}@users.noreply.github.com`
+            }
+        });
+
+        console.log('✓ File uploaded successfully!');
+
+        // Enable GitHub Pages
+        console.log('Enabling GitHub Pages...');
+        try {
+            await octokit.rest.repos.createPagesSite({
+                owner: GITHUB_OWNER,
+                repo: repoName,
+                source: {
+                    branch: repo.default_branch || 'main',
+                    path: '/'
+                }
+            });
+            console.log('✓ GitHub Pages enabled');
+        } catch (error) {
+            if (error.status === 409) {
+                console.log('✓ GitHub Pages already enabled');
+            } else {
+                console.log('⚠ Could not enable GitHub Pages automatically. Enable it manually in repository settings.');
+            }
+        }
+
+        // Verify the upload
+        console.log('Verifying upload...');
+        const { data: verifyFile } = await octokit.rest.repos.getContent({
+            owner: GITHUB_OWNER,
+            repo: repoName,
+            path: fileName
+        });
+
+        console.log('✓ Upload verified successfully!');
+
+        // Clean up local file
+        try {
+            fs.unlinkSync(tempFilePath);
+            console.log('✓ Local file cleaned up');
+        } catch (error) {
+            console.log('⚠ Could not delete local file');
+        }
+
+        // Construct URLs
+        const htmlUrl = result.content.html_url;
+        const rawUrl = `https://raw.githubusercontent.com/${GITHUB_OWNER}/${repoName}/${repo.default_branch}/${fileName}`;
+        const githubPagesUrl = `https://${GITHUB_OWNER}.github.io/${repoName}/${fileName}`;
+
+        return {
+            success: true,
+            message: 'Repository created and file uploaded successfully',
+            commit: {
+                sha: result.commit.sha,
+                url: result.commit.html_url
+            },
+            file: {
+                name: fileName,
+                size: verifyFile.size,
+                htmlUrl: htmlUrl,
+                rawUrl: rawUrl,
+                downloadUrl: verifyFile.download_url,
+                localPath: tempFilePath
+            },
+            githubPagesUrl: githubPagesUrl,
+            repository: {
+                name: repo.full_name,
+                url: repo.html_url,
+                cloneUrl: repo.clone_url,
+                sshUrl: repo.ssh_url,
+                defaultBranch: repo.default_branch
+            },
+            instructions: `GitHub Pages URL may take a few minutes to become active: ${githubPagesUrl}`,
+            timestamp: new Date().toISOString()
+        };
+
+    } catch (error) {
+        console.error('Error in GitHub operation:', error);
+        
+        let errorMessage = 'Unknown error occurred';
+        let errorDetails = {};
+
+        if (error.status === 401) {
+            errorMessage = 'Authentication failed. Invalid GitHub token.';
+        } else if (error.status === 403) {
+            errorMessage = 'Permission denied. Token may lack required scopes (public_repo or repo).';
+            errorDetails.requiredScopes = ['public_repo', 'repo'];
+        } else if (error.status === 404) {
+            errorMessage = 'Resource not found or access denied.';
+        } else if (error.status === 422) {
+            errorMessage = error.message || 'Invalid request. Check repository name and file content.';
+        } else {
+            errorMessage = error.message;
+        }
+
+        return {
+            success: false,
+            error: errorMessage,
+            details: errorDetails,
+            timestamp: new Date().toISOString()
+        };
+    }
+}
 
 app.listen(port,()=>{
 console.log(`Server is running at http://localhost:${port}`);
